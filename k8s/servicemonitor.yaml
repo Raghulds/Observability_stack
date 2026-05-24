@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: obs
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: obs
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: obs
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
