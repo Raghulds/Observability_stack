@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -53,6 +54,7 @@ var (
 	)
 )
 
+// ResponseRecorder is a wrapper around http.ResponseWriter that tracks the status code and the number of bytes written.
 type responseRecorder struct {
 	http.ResponseWriter
 	status       int
@@ -76,6 +78,8 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 func instrument(path string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		start := time.Now()
+
+		// Track in-flight requests
 		httpInFlightRequests.Inc()
 		defer httpInFlightRequests.Dec()
 
@@ -83,9 +87,26 @@ func instrument(path string, h http.HandlerFunc) http.HandlerFunc {
 		h(rec, req)
 
 		status := strconv.Itoa(rec.status)
+		duration := time.Since(start)
 		httpRequestsTotal.WithLabelValues(req.Method, path, status).Inc()
-		httpRequestDurationSeconds.WithLabelValues(req.Method, path).Observe(time.Since(start).Seconds())
+		httpRequestDurationSeconds.WithLabelValues(req.Method, path).Observe(duration.Seconds())
 		httpResponseSizeBytes.WithLabelValues(req.Method, path).Observe(float64(rec.bytesWritten))
+
+		level := slog.LevelInfo
+		if rec.status >= 500 {
+			level = slog.LevelError
+		} else if rec.status >= 400 {
+			level = slog.LevelWarn
+		}
+		slog.LogAttrs(req.Context(), level, "http_request",
+			slog.String("method", req.Method),
+			slog.String("path", path),
+			slog.Int("status", rec.status),
+			slog.Int64("duration_ms", duration.Milliseconds()),
+			slog.Int64("bytes", rec.bytesWritten),
+			slog.String("remote_addr", req.RemoteAddr),
+			slog.String("user_agent", req.UserAgent()),
+		)
 	}
 }
 
@@ -176,6 +197,11 @@ func healthzHandler(w http.ResponseWriter, _ *http.Request) {
 type portKey struct{}
 
 func main() {
+	slogHandlerOpts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	slogJsonHandler := slog.NewJSONHandler(os.Stdout, slogHandlerOpts)
+	logger := slog.New(slogJsonHandler)
+	slog.SetDefault(logger)
+
 	addr := ":2112"
 	port := "2112"
 
@@ -196,8 +222,9 @@ func main() {
 		},
 	}
 
-	log.Printf("Server is listening on %s", addr)
+	slog.Info("server_listening", "addr", addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Server error: %v", err)
+		slog.Error("server_error", "err", err.Error())
+		os.Exit(1)
 	}
 }
