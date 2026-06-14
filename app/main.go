@@ -17,6 +17,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -98,7 +106,7 @@ func instrument(path string, h http.HandlerFunc) http.HandlerFunc {
 		} else if rec.status >= 400 {
 			level = slog.LevelWarn
 		}
-		slog.LogAttrs(req.Context(), level, "http_request",
+		attrs := []slog.Attr{
 			slog.String("method", req.Method),
 			slog.String("path", path),
 			slog.Int("status", rec.status),
@@ -106,8 +114,24 @@ func instrument(path string, h http.HandlerFunc) http.HandlerFunc {
 			slog.Int64("bytes", rec.bytesWritten),
 			slog.String("remote_addr", req.RemoteAddr),
 			slog.String("user_agent", req.UserAgent()),
-		)
+		}
+		// Correlate logs with traces: attach the active trace/span ids so the
+		// same identifiers are searchable in Kibana and clickable in Jaeger.
+		if sc := trace.SpanContextFromContext(req.Context()); sc.HasTraceID() {
+			attrs = append(attrs,
+				slog.String("trace_id", sc.TraceID().String()),
+				slog.String("span_id", sc.SpanID().String()),
+			)
+		}
+		slog.LogAttrs(req.Context(), level, "http_request", attrs...)
 	}
+}
+
+// traced wraps an instrumented handler with an OpenTelemetry server span named
+// after the route, so each request produces a span whose context (trace id) is
+// available to the inner instrument() logger.
+func traced(path string, h http.HandlerFunc) http.Handler {
+	return otelhttp.NewHandler(instrument(path, h), path)
 }
 
 func rootHandler(w http.ResponseWriter, _ *http.Request) {
@@ -157,9 +181,17 @@ func simulateHandler(w http.ResponseWriter, req *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(seconds)*time.Second)
 	go func() {
 		defer cancel()
+		// Root span for the whole load run; each outbound request becomes a
+		// child, and otelhttp.NewTransport injects the W3C traceparent header so
+		// the receiving /work and /fail handlers continue the same trace.
+		runCtx, runSpan := otel.Tracer("obs").Start(context.Background(), "simulate_load")
+		defer runSpan.End()
 		ticker := time.NewTicker(time.Second / time.Duration(rps))
 		defer ticker.Stop()
-		client := &http.Client{Timeout: 5 * time.Second}
+		client := &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: otelhttp.NewTransport(http.DefaultTransport),
+		}
 		var wg sync.WaitGroup
 		for {
 			select {
@@ -171,7 +203,11 @@ func simulateHandler(w http.ResponseWriter, req *http.Request) {
 				go func() {
 					defer wg.Done()
 					target := targets[rand.Intn(len(targets))]
-					resp, err := client.Get(target)
+					httpReq, err := http.NewRequestWithContext(runCtx, http.MethodGet, target, nil)
+					if err != nil {
+						return
+					}
+					resp, err := client.Do(httpReq)
 					if err == nil {
 						_ = resp.Body.Close()
 					}
@@ -196,20 +232,62 @@ func healthzHandler(w http.ResponseWriter, _ *http.Request) {
 
 type portKey struct{}
 
+// initTracer configures a global OpenTelemetry TracerProvider that exports
+// spans over OTLP/gRPC. The endpoint is read from the standard
+// OTEL_EXPORTER_OTLP_ENDPOINT env var (http:// scheme => insecure). It returns
+// a shutdown func that flushes buffered spans.
+func initTracer(ctx context.Context) (func(context.Context) error, error) {
+	exporter, err := otlptracegrpc.New(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := resource.New(ctx,
+		resource.WithAttributes(semconv.ServiceName("obs")),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	return tp.Shutdown, nil
+}
+
 func main() {
 	slogHandlerOpts := &slog.HandlerOptions{Level: slog.LevelInfo}
 	slogJsonHandler := slog.NewJSONHandler(os.Stdout, slogHandlerOpts)
 	logger := slog.New(slogJsonHandler)
 	slog.SetDefault(logger)
 
+	shutdownTracer, err := initTracer(context.Background())
+	if err != nil {
+		slog.Error("tracer_init_error", "err", err.Error())
+		os.Exit(1)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracer(ctx); err != nil {
+			slog.Error("tracer_shutdown_error", "err", err.Error())
+		}
+	}()
+
 	addr := ":2112"
 	port := "2112"
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", instrument("/", rootHandler))
-	mux.HandleFunc("/work", instrument("/work", workHandler))
-	mux.HandleFunc("/fail", instrument("/fail", failHandler))
-	mux.HandleFunc("/simulate", instrument("/simulate", simulateHandler))
+	mux.Handle("/", traced("/", rootHandler))
+	mux.Handle("/work", traced("/work", workHandler))
+	mux.Handle("/fail", traced("/fail", failHandler))
+	mux.Handle("/simulate", traced("/simulate", simulateHandler))
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.Handle("/metrics", promhttp.Handler())
 

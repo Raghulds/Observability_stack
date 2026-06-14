@@ -23,6 +23,11 @@ spec:
             - name: metrics
               containerPort: 2112
               protocol: TCP
+          env:
+            # http:// scheme tells the OTLP/gRPC exporter to use an insecure
+            # (non-TLS) connection to the in-cluster collector.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.tracing.svc.cluster.local:4317
           livenessProbe:
             httpGet:
               path: /healthz
